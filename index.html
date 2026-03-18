@@ -1,0 +1,1316 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Portal de Certificados de Retención</title>
+
+<!--
+=============================================================
+  PORTAL DE CERTIFICADOS DE RETENCIÓN
+  Retención en la Fuente · IVA · ICA
+=============================================================
+
+  CONFIGURACIÓN RÁPIDA (lee esto primero):
+
+  1. REGISTRAR APP EN AZURE
+     - Ve a https://portal.azure.com → Azure Active Directory → Registros de aplicaciones
+     - Nueva aplicación → nombre: "Portal Certificados"
+     - Tipo de cuenta: "Solo esta organización" (si tus proveedores tienen M365)
+       O "Cuentas en cualquier directorio + cuentas personales" (más flexible)
+     - URI de redireccionamiento: pon la URL donde publicarás este HTML
+       Ej: https://tu-empresa.github.io/certificados/
+     - Copia el "Id. de aplicación (cliente)" → pégalo en CLIENT_ID abajo
+     - Copia el "Id. de directorio (inquilino)" → pégalo en TENANT_ID abajo
+
+  2. PERMISOS DE LA APP
+     - En la app registrada → Permisos de API → Agregar permiso
+     - Microsoft Graph → Permisos delegados → Files.Read.All
+     - (Opcional) User.Read para identificar al usuario
+
+  3. CARPETA EN ONEDRIVE
+     Estructura esperada:
+       Certificados 2024/
+         ├── 900123456/
+         │     ├── RTF_900123456_B1_2024.pdf
+         │     └── IVA_900123456_B1_2024.pdf
+         └── 800456789/
+               └── RTF_800456789_B1_2024.pdf
+
+     La carpeta raíz se configura en ONEDRIVE_FOLDER_PATH abajo.
+
+  4. ARCHIVO DE PROVEEDORES (providers.json)
+     Crea un archivo providers.json en la misma carpeta que este HTML:
+     {
+       "900123456": { "name": "Suministros Técnicos S.A.S", "pass": "CERT34562024", "email": "cxp@empresa.com" },
+       "800456789": { "name": "Logística Andina Ltda.",     "pass": "CERT47892024", "email": "ctb@logistica.com" }
+     }
+     Fórmula Excel para contraseñas: =CONCAT("CERT",DERECHA(A2,4),AÑO(HOY()))
+
+  5. PUBLICAR
+     - GitHub Pages: sube index.html + providers.json al repositorio → Settings → Pages
+     - SharePoint: Documentos → Cargar → pegar URL en página de SharePoint
+
+=============================================================
+-->
+
+<!-- MSAL (Microsoft Authentication Library) -->
+<script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@2.38.3/lib/msal-browser.min.js"></script>
+
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&family=DM+Mono:wght@400;500&display=swap');
+
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+
+:root{
+  --bg:#F5F4F0;
+  --surface:#fff;
+  --s2:#EEEDE8;
+  --s3:#E6E4DE;
+  --border:rgba(0,0,0,0.09);
+  --border2:rgba(0,0,0,0.15);
+  --text:#18180F;
+  --muted:#6A6A62;
+  --hint:#9A9A90;
+  --green:#1B4D3A;
+  --green-l:#E0EFE8;
+  --green-m:#4A8C6A;
+  --red:#B83232;
+  --red-l:#FDEAEA;
+  --blue:#1A4A8C;
+  --blue-l:#E6EEFB;
+  --amber:#8C5C00;
+  --amber-l:#FDF4E0;
+  --purple-l:#EDE8FB;
+  --purple:#5A3CB5;
+  --r:12px;
+  --rs:8px;
+  --mono:'DM Mono',monospace;
+  --sans:'DM Sans',sans-serif;
+}
+
+html,body{height:100%;font-family:var(--sans);background:var(--bg);color:var(--text)}
+
+/* ── HEADER ── */
+.hdr{
+  background:var(--green);
+  padding:14px 28px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  position:sticky;top:0;z-index:100;
+}
+.hdr-brand{display:flex;align-items:center;gap:11px}
+.hdr-icon{
+  width:32px;height:32px;
+  background:rgba(255,255,255,0.15);
+  border-radius:8px;
+  display:flex;align-items:center;justify-content:center;
+  flex-shrink:0;
+}
+.hdr-texts .sub{font-size:11px;color:rgba(255,255,255,0.5);font-weight:300}
+.hdr-texts .title{font-size:13px;font-weight:500;color:rgba(255,255,255,0.95)}
+.hdr-right{display:flex;align-items:center;gap:10px}
+.hdr-year{font-family:var(--mono);font-size:11px;color:rgba(255,255,255,0.55);background:rgba(255,255,255,0.1);padding:3px 10px;border-radius:20px}
+.hdr-user{font-size:12px;color:rgba(255,255,255,0.7);display:none}
+
+/* ── LAYOUT ── */
+.page{min-height:calc(100vh - 56px);display:flex;align-items:flex-start;justify-content:center;padding:36px 16px 60px}
+.wrap{width:100%;max-width:540px}
+.wrap.wide{max-width:720px}
+
+/* ── SCREENS ── */
+.screen{display:none}
+.screen.active{display:block}
+
+/* ── CARD ── */
+.card{
+  background:var(--surface);
+  border:0.5px solid var(--border2);
+  border-radius:var(--r);
+  padding:30px 26px;
+}
+
+/* ── FORM ── */
+.field{margin-bottom:15px}
+.field label{
+  display:block;
+  font-size:11.5px;font-weight:500;
+  color:var(--muted);
+  letter-spacing:.05em;text-transform:uppercase;
+  margin-bottom:5px;
+}
+.field input{
+  width:100%;height:44px;
+  background:var(--s2);
+  border:0.5px solid var(--border2);
+  border-radius:var(--rs);
+  padding:0 14px;
+  font-family:var(--mono);font-size:14px;color:var(--text);
+  outline:none;
+  transition:border-color .15s,background .15s,box-shadow .15s;
+}
+.field input:focus{
+  border-color:var(--green-m);
+  background:var(--surface);
+  box-shadow:0 0 0 3px rgba(27,77,58,.09);
+}
+.field input.err{border-color:var(--red);background:var(--red-l)}
+.err-msg{display:none;font-size:12px;color:var(--red);margin-top:5px;align-items:center;gap:5px}
+.err-msg.show{display:flex}
+
+/* ── BUTTONS ── */
+.btn{
+  height:44px;
+  border:none;border-radius:var(--rs);
+  font-family:var(--sans);font-size:13.5px;font-weight:500;
+  cursor:pointer;
+  display:inline-flex;align-items:center;justify-content:center;gap:7px;
+  transition:opacity .15s,transform .1s,background .15s;
+  padding:0 18px;
+}
+.btn:active{transform:scale(.98)}
+.btn-primary{background:var(--green);color:#fff;width:100%}
+.btn-primary:hover{opacity:.87}
+.btn-primary.loading{opacity:.6;pointer-events:none}
+.btn-sm{height:34px;font-size:12px;padding:0 13px}
+.btn-outline{background:none;border:0.5px solid var(--border2);color:var(--muted)}
+.btn-outline:hover{background:var(--s2)}
+.btn-danger-outline{background:none;border:0.5px solid #C97070;color:var(--red)}
+.btn-danger-outline:hover{background:var(--red-l)}
+.btn-ms{background:#0078D4;color:#fff;width:100%;font-size:13px}
+.btn-ms:hover{opacity:.88}
+
+/* ── SPINNER ── */
+.spinner{width:15px;height:15px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;display:none}
+.loading .spinner{display:block}
+.loading .btn-text{display:none}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ── SECURITY NOTE ── */
+.sec-note{
+  display:flex;align-items:center;gap:8px;
+  margin-top:15px;padding:10px 13px;
+  background:var(--s2);border-radius:var(--rs);
+  font-size:11.5px;color:var(--muted);line-height:1.4;
+}
+
+/* ── PORTAL HEADER ── */
+.portal-hdr{
+  display:flex;justify-content:space-between;align-items:flex-start;
+  margin-bottom:22px;
+}
+.provider-name{font-size:19px;font-weight:500;margin-bottom:5px}
+.nit-pill{
+  font-family:var(--mono);font-size:11.5px;
+  color:var(--green-m);background:var(--green-l);
+  padding:3px 10px;border-radius:20px;display:inline-block;
+}
+
+/* ── SECTION LABEL ── */
+.section-lbl{
+  font-size:11px;font-weight:500;color:var(--muted);
+  letter-spacing:.08em;text-transform:uppercase;
+  margin-bottom:10px;
+}
+
+/* ── CERTIFICATE LIST ── */
+.cert-list{display:flex;flex-direction:column;gap:7px}
+.cert-row{
+  background:var(--surface);
+  border:0.5px solid var(--border2);
+  border-radius:var(--rs);
+  padding:13px 15px;
+  display:flex;align-items:center;gap:13px;
+  transition:border-color .15s;
+}
+.cert-row:hover{border-color:var(--green-m)}
+.cert-ico{
+  width:36px;height:36px;border-radius:9px;
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;
+}
+.ico-fuente{background:var(--blue-l)}
+.ico-iva{background:var(--amber-l)}
+.ico-ica{background:var(--purple-l)}
+.cert-info{flex:1;min-width:0}
+.cert-name{font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:3px}
+.cert-meta{display:flex;gap:8px;align-items:center;font-size:11.5px;color:var(--muted)}
+.badge{font-size:10px;font-weight:500;padding:2px 7px;border-radius:4px;letter-spacing:.03em;text-transform:uppercase}
+.b-fuente{background:var(--blue-l);color:var(--blue)}
+.b-iva{background:var(--amber-l);color:var(--amber)}
+.b-ica{background:var(--purple-l);color:var(--purple)}
+.btn-dl{
+  background:none;border:0.5px solid var(--border2);
+  border-radius:var(--rs);padding:7px 13px;
+  font-family:var(--sans);font-size:12px;color:var(--green);
+  cursor:pointer;display:flex;align-items:center;gap:5px;
+  font-weight:500;white-space:nowrap;
+  transition:background .15s,border-color .15s;
+}
+.btn-dl:hover{background:var(--green-l);border-color:var(--green-m)}
+.btn-dl:disabled{opacity:.4;pointer-events:none}
+.btn-dl.downloading{opacity:.6;pointer-events:none}
+
+/* ── INFO BOX ── */
+.info-box{
+  margin-top:20px;padding:12px 14px;
+  background:var(--surface);border:0.5px solid var(--border2);
+  border-radius:var(--rs);font-size:12px;color:var(--muted);
+  display:flex;gap:9px;align-items:flex-start;line-height:1.5;
+}
+
+/* ── ADMIN TAB BAR ── */
+.tab-bar{
+  display:flex;
+  border-bottom:0.5px solid var(--border2);
+  background:var(--surface);
+  padding:0 24px;
+  margin:-36px -16px 28px;
+  position:sticky;top:56px;z-index:90;
+}
+.tab{
+  padding:12px 16px;font-size:13px;font-weight:500;
+  color:var(--muted);cursor:pointer;
+  border-bottom:2px solid transparent;margin-bottom:-0.5px;
+  transition:color .15s;
+}
+.tab.active{color:var(--green);border-bottom-color:var(--green)}
+
+/* ── STAT GRID ── */
+.stat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:20px}
+.stat-card{
+  background:var(--surface);border:0.5px solid var(--border2);
+  border-radius:var(--rs);padding:14px 16px;
+}
+.stat-val{font-size:24px;font-weight:500;margin-bottom:2px}
+.stat-lbl{font-size:11.5px;color:var(--muted)}
+
+/* ── UPLOAD ZONE ── */
+.upload-zone{
+  border:1.5px dashed var(--border2);border-radius:var(--r);
+  padding:30px 20px;text-align:center;cursor:pointer;
+  transition:background .15s,border-color .15s;
+  background:var(--surface);
+}
+.upload-zone:hover,.upload-zone.drag{background:var(--green-l);border-color:var(--green-m)}
+.upload-zone p{font-size:13px;color:var(--muted);margin-top:8px}
+.upload-zone strong{color:var(--green)}
+.upload-zone small{display:block;font-size:11.5px;color:var(--hint);margin-top:3px}
+
+/* ── PROVIDER TABLE ── */
+.tbl-wrap{
+  background:var(--surface);border:0.5px solid var(--border2);
+  border-radius:var(--r);overflow:hidden;overflow-x:auto;
+}
+.provider-table{width:100%;border-collapse:collapse;font-size:13px}
+.provider-table th{
+  text-align:left;padding:9px 12px;
+  font-size:11px;font-weight:500;color:var(--muted);
+  letter-spacing:.05em;text-transform:uppercase;
+  border-bottom:0.5px solid var(--border2);background:var(--s2);
+}
+.provider-table td{padding:10px 12px;border-bottom:0.5px solid var(--border)}
+.provider-table tr:last-child td{border-bottom:none}
+.provider-table tr:hover td{background:var(--s2)}
+.pass-cell{font-family:var(--mono);font-size:11.5px;color:var(--muted);letter-spacing:.03em}
+
+/* ── HINT BOX ── */
+.hint-box{
+  background:var(--blue-l);border:0.5px solid rgba(26,74,140,.15);
+  border-radius:var(--rs);padding:12px 14px;
+  font-size:12px;color:var(--blue);margin-bottom:14px;line-height:1.6;
+}
+.hint-box strong{color:var(--blue)}
+
+/* ── ALERT ── */
+.alert{
+  display:none;padding:11px 14px;border-radius:var(--rs);
+  font-size:12.5px;line-height:1.5;
+  align-items:center;gap:8px;margin-bottom:14px;
+}
+.alert.show{display:flex}
+.alert-success{background:var(--green-l);border:0.5px solid rgba(27,77,58,.2);color:var(--green)}
+.alert-error{background:var(--red-l);border:0.5px solid rgba(184,50,50,.2);color:var(--red)}
+.alert-info{background:var(--blue-l);border:0.5px solid rgba(26,74,140,.2);color:var(--blue)}
+
+/* ── CODE BLOCK ── */
+.code-block{
+  font-family:var(--mono);font-size:11.5px;
+  background:var(--s2);padding:11px 13px;
+  border-radius:var(--rs);line-height:1.8;
+  margin:8px 0;color:var(--muted);
+  overflow-x:auto;
+}
+.code-block .key{color:var(--green);font-weight:500}
+.code-block .val{color:var(--blue)}
+
+/* ── STEP LIST ── */
+.step-list{display:flex;flex-direction:column;gap:20px}
+.step{display:flex;gap:14px}
+.step-num{
+  width:26px;height:26px;border-radius:50%;
+  background:var(--green);color:#fff;
+  font-size:12px;font-weight:600;
+  display:flex;align-items:center;justify-content:center;
+  flex-shrink:0;margin-top:1px;
+}
+.step-body h4{font-size:14px;font-weight:500;margin-bottom:5px}
+.step-body p{font-size:13px;color:var(--muted);line-height:1.6}
+
+/* ── DIVIDER ── */
+.divider{border:none;border-top:0.5px solid var(--border);margin:20px 0}
+
+/* ── LOADING OVERLAY ── */
+#loading-overlay{
+  position:fixed;inset:0;background:rgba(245,244,240,.85);
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:14px;z-index:999;
+}
+#loading-overlay p{font-size:13px;color:var(--muted)}
+.big-spinner{
+  width:36px;height:36px;
+  border:3px solid var(--border2);
+  border-top-color:var(--green);
+  border-radius:50%;
+  animation:spin .8s linear infinite;
+}
+
+/* ── EMPTY STATE ── */
+.empty{text-align:center;padding:44px 20px;color:var(--muted);font-size:13px}
+.empty svg{margin-bottom:12px;opacity:.4}
+
+/* ── RESPONSIVE ── */
+@media(max-width:480px){
+  .hdr{padding:12px 16px}
+  .hdr-texts .title{display:none}
+  .stat-grid{grid-template-columns:repeat(2,1fr)}
+  .portal-hdr{flex-direction:column;gap:12px}
+}
+</style>
+</head>
+<body>
+
+<!-- ========================================================
+     ⚙️  CONFIGURACIÓN — EDITA ESTOS VALORES
+     ======================================================== -->
+<script>
+// ── 1. AZURE APP REGISTRATION ──────────────────────────────
+// Copia estos valores desde portal.azure.com
+const CLIENT_ID   = "a18e4719-7dcd-4717-8f87-71824ed1c743";
+const TENANT_ID   = "985d8a12-af4f-4e22-9878-354f9d3d18f2";
+                                                // O usa "common" para cuentas mixtas
+
+// ── 2. ONEDRIVE ────────────────────────────────────────────
+// Ruta de la carpeta raíz en OneDrive (relativa a la raíz del drive)
+const ONEDRIVE_FOLDER_PATH = "CERTIFICADOS PROV";
+
+// ── 3. CONTRASEÑA DEL PANEL ADMIN ─────────────────────────
+const ADMIN_PASS = "Admin@2024!";               // Cámbiala antes de publicar
+
+// ── 4. AÑO A MOSTRAR ───────────────────────────────────────
+const CERT_YEAR = "2025";
+
+// ── 5. DATOS DE CONTACTO (aparecen en el portal) ──────────
+const CONTACT_EMAIL = "auxiliar.contable@oinac.com.co";
+const CONTACT_TEL   = "6931351 EXT 2715";
+</script>
+
+<!-- ========================================================
+     ESTRUCTURA HTML
+     ======================================================== -->
+
+<!-- Overlay de carga -->
+<div id="loading-overlay" style="display:none">
+  <div class="big-spinner"></div>
+  <p id="loading-msg">Cargando...</p>
+</div>
+
+<!-- HEADER -->
+<header class="hdr">
+  <div class="hdr-brand">
+    <div class="hdr-icon">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+        <polyline points="14,2 14,8 20,8"/>
+        <line x1="16" y1="13" x2="8" y2="13"/>
+        <line x1="16" y1="17" x2="8" y2="17"/>
+      </svg>
+    </div>
+    <div class="hdr-texts">
+      <div class="sub">Portal seguro · Certificados de retención</div>
+      <div class="title">Retención Fuente · IVA · ICA &nbsp;|&nbsp; <span id="hdr-year"></span></div>
+    </div>
+  </div>
+  <div class="hdr-right">
+    <div class="hdr-year" id="hdr-year-badge"></div>
+    <div class="hdr-user" id="hdr-user-label"></div>
+  </div>
+</header>
+
+<div class="page" id="page">
+<div class="wrap" id="main-wrap">
+
+  <!-- ══════════════════════════════════════════════════════
+       PANTALLA 1: LOGIN PROVEEDOR
+       ══════════════════════════════════════════════════════ -->
+  <div class="screen active" id="s-login">
+    <div class="card">
+      <div style="width:50px;height:50px;background:var(--green-l);border-radius:13px;display:flex;align-items:center;justify-content:center;margin-bottom:18px">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#1B4D3A" stroke-width="1.8" stroke-linecap="round">
+          <rect x="3" y="11" width="18" height="11" rx="2"/>
+          <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+        </svg>
+      </div>
+      <div style="font-size:20px;font-weight:500;margin-bottom:5px">Acceso a sus certificados</div>
+      <div style="font-size:13px;color:var(--muted);margin-bottom:26px;line-height:1.5">
+        Ingrese su NIT y la contraseña asignada por el área de contabilidad para consultar y descargar sus certificados de retención.
+      </div>
+
+      <div class="alert alert-error" id="login-error">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        <span id="login-error-txt">NIT o contraseña incorrectos.</span>
+      </div>
+
+      <div class="field">
+        <label>NIT del proveedor</label>
+        <input type="text" id="inp-nit" placeholder="Ej: 900123456" maxlength="15" autocomplete="off" inputmode="numeric"/>
+      </div>
+      <div class="field">
+        <label>Contraseña</label>
+        <input type="password" id="inp-pass" placeholder="Contraseña asignada por contabilidad" autocomplete="current-password"/>
+      </div>
+
+      <button class="btn btn-primary" id="btn-login">
+        <div class="spinner"></div>
+        <span class="btn-text">Ingresar</span>
+      </button>
+
+      <div class="sec-note">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" style="flex-shrink:0">
+          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+        </svg>
+        Acceso individual y privado. Ningún proveedor puede ver los documentos de otro.
+      </div>
+      <div style="margin-top:11px;text-align:center;font-size:12px;color:var(--hint)">
+        ¿Olvidó su contraseña? Comuníquese con contabilidad:<br>
+        <span id="contact-info" style="color:var(--muted)"></span>
+      </div>
+    </div>
+
+    <div style="text-align:center;margin-top:16px">
+      <button class="btn btn-sm btn-outline" id="btn-go-admin" style="font-size:11.5px;gap:6px">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="8" r="4"/><path d="M6 20v-2a6 6 0 0 1 12 0v2"/>
+        </svg>
+        Acceso administrador
+      </button>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       PANTALLA 2: LOGIN ADMIN
+       ══════════════════════════════════════════════════════ -->
+  <div class="screen" id="s-admin-login">
+    <div class="card">
+      <div style="font-size:16px;font-weight:500;margin-bottom:4px">Panel de administración</div>
+      <div style="font-size:13px;color:var(--muted);margin-bottom:22px">Solo para el equipo de contabilidad.</div>
+
+      <div class="alert alert-error" id="admin-login-error">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/></svg>
+        Contraseña de administrador incorrecta.
+      </div>
+
+      <div class="field">
+        <label>Contraseña de administrador</label>
+        <input type="password" id="inp-admin-pass" placeholder="Contraseña admin"/>
+      </div>
+      <button class="btn btn-primary" id="btn-admin-login">
+        <div class="spinner"></div>
+        <span class="btn-text">Entrar al panel</span>
+      </button>
+      <button class="btn btn-outline btn-sm" id="btn-back-to-login" style="width:100%;margin-top:9px">
+        ← Volver al portal de proveedores
+      </button>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       PANTALLA 3: PORTAL PROVEEDOR
+       ══════════════════════════════════════════════════════ -->
+  <div class="screen" id="s-portal">
+    <div class="portal-hdr">
+      <div>
+        <div class="provider-name" id="p-name">—</div>
+        <span class="nit-pill" id="p-nit">—</span>
+      </div>
+      <button class="btn btn-sm btn-outline" id="btn-logout">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+          <polyline points="16,17 21,12 16,7"/>
+          <line x1="21" y1="12" x2="9" y2="12"/>
+        </svg>
+        Cerrar sesión
+      </button>
+    </div>
+
+    <div class="alert alert-info" id="graph-loading-alert">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0;animation:spin 1s linear infinite"><path d="M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z" opacity=".3"/><path d="M21 12a9 9 0 0 1-9 9"/></svg>
+      Cargando certificados desde OneDrive...
+    </div>
+
+    <div class="alert alert-error" id="graph-error-alert">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/></svg>
+      <span id="graph-error-txt">Error al cargar los certificados.</span>
+    </div>
+
+    <div class="section-lbl" id="certs-label" style="display:none">Certificados disponibles</div>
+    <div class="cert-list" id="cert-list"></div>
+
+    <div class="info-box" id="info-contact" style="display:none">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" style="flex-shrink:0;margin-top:1px">
+        <circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>
+      </svg>
+      <span>Si hay algún error o no encuentra algún certificado, comuníquese con contabilidad: <span id="portal-contact"></span></span>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       PANTALLA 4: PANEL ADMIN
+       ══════════════════════════════════════════════════════ -->
+  <div class="screen" id="s-admin">
+
+    <div class="tab-bar">
+      <div class="tab active" data-tab="t-dashboard">Panel</div>
+      <div class="tab" data-tab="t-providers">Proveedores</div>
+      <div class="tab" data-tab="t-setup">Configuración</div>
+    </div>
+
+    <!-- TAB: DASHBOARD -->
+    <div id="t-dashboard">
+      <div class="stat-grid">
+        <div class="stat-card">
+          <div class="stat-val" id="stat-total">0</div>
+          <div class="stat-lbl">Proveedores</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-val" id="stat-certs">—</div>
+          <div class="stat-lbl">Certificados OneDrive</div>
+        </div>
+        <div class="stat-card" style="display:flex;flex-direction:column;justify-content:center">
+          <button class="btn btn-sm btn-danger-outline" id="btn-admin-logout" style="align-self:flex-start">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+              <polyline points="16,17 21,12 16,7"/><line x1="21" y1="12" x2="9" y2="12"/>
+            </svg>
+            Salir
+          </button>
+          <div class="stat-lbl" style="margin-top:7px">Sesión admin</div>
+        </div>
+      </div>
+
+      <div class="alert alert-info" id="dash-ms-alert" style="display:none">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        Conéctese a OneDrive para ver el conteo de certificados en vivo.
+      </div>
+
+      <div style="display:flex;gap:9px;flex-wrap:wrap;margin-bottom:20px">
+        <button class="btn btn-sm" id="btn-connect-ms" style="background:var(--blue);color:#fff;gap:7px">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+          Conectar OneDrive / Microsoft
+        </button>
+        <button class="btn btn-sm btn-outline" id="btn-export-csv">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7,10 12,15 17,10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Exportar lista CSV
+        </button>
+      </div>
+
+      <div class="hint-box">
+        <strong>Estado de OneDrive:</strong> <span id="onedrive-status">No conectado. Haga clic en "Conectar OneDrive" para autenticarse con su cuenta Microsoft 365.</span>
+      </div>
+    </div>
+
+    <!-- TAB: PROVEEDORES -->
+    <div id="t-providers" style="display:none">
+      <div class="alert alert-success" id="upload-success">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20,6 9,17 4,12"/></svg>
+        <span id="upload-success-txt">Archivo cargado correctamente.</span>
+      </div>
+
+      <div style="margin-bottom:18px">
+        <div class="hint-box">
+          El archivo debe tener 4 columnas: <strong>NIT · Nombre · Email · Contraseña</strong><br>
+          Descargue la plantilla para ver el formato exacto.
+        </div>
+        <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+          <button class="btn btn-sm btn-outline" id="btn-download-template">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7,10 12,15 17,10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            Descargar plantilla CSV
+          </button>
+        </div>
+
+        <div class="upload-zone" id="upload-zone">
+          <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#4A8C6A" stroke-width="1.5" stroke-linecap="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="17,8 12,3 7,8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+          <p><strong>Arrastra tu archivo aquí</strong> o haz clic para seleccionar</p>
+          <small>Formatos: .csv (separado por comas)</small>
+          <input type="file" id="file-input" accept=".csv,text/csv" style="display:none"/>
+        </div>
+      </div>
+
+      <div style="font-size:14px;font-weight:500;margin-bottom:10px">
+        Proveedores registrados (<span id="tbl-count">0</span>)
+      </div>
+      <div class="tbl-wrap">
+        <table class="provider-table">
+          <thead>
+            <tr>
+              <th>NIT</th>
+              <th>Nombre</th>
+              <th>Email</th>
+              <th>Contraseña</th>
+            </tr>
+          </thead>
+          <tbody id="provider-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- TAB: CONFIGURACIÓN / INSTRUCCIONES -->
+    <div id="t-setup" style="display:none">
+      <div class="card">
+        <div style="font-size:15px;font-weight:500;margin-bottom:18px">Guía de configuración</div>
+        <div class="step-list">
+
+          <div class="step">
+            <div class="step-num">1</div>
+            <div class="step-body">
+              <h4>Registrar la aplicación en Azure</h4>
+              <p>Ve a <a href="https://portal.azure.com" target="_blank" style="color:var(--blue)">portal.azure.com</a> → Azure Active Directory → Registros de aplicaciones → Nueva aplicación.</p>
+              <div class="code-block">
+                Nombre: Portal Certificados<br>
+                URI de redireccionamiento: <span class="val" id="current-url">https://tu-sitio.com/</span><br>
+                Permiso requerido: <span class="key">Files.Read.All</span>
+              </div>
+              <p>Copia el <strong>Client ID</strong> y el <strong>Tenant ID</strong> y pégalos en la sección de configuración del archivo HTML.</p>
+            </div>
+          </div>
+
+          <hr class="divider"/>
+
+          <div class="step">
+            <div class="step-num">2</div>
+            <div class="step-body">
+              <h4>Estructura de carpetas en OneDrive</h4>
+              <p>La carpeta raíz debe llamarse exactamente como configuraste en <code style="font-family:var(--mono);font-size:12px;background:var(--s2);padding:1px 5px;border-radius:4px">ONEDRIVE_FOLDER_PATH</code>.</p>
+              <div class="code-block">
+                <span class="key">Certificados 2024/</span><br>
+                &nbsp;&nbsp;├── <span class="val">900123456/</span><br>
+                &nbsp;&nbsp;│&nbsp;&nbsp;&nbsp;├── RTF_900123456_B1_2024.pdf<br>
+                &nbsp;&nbsp;│&nbsp;&nbsp;&nbsp;├── IVA_900123456_B1_2024.pdf<br>
+                &nbsp;&nbsp;│&nbsp;&nbsp;&nbsp;└── ICA_900123456_2024.pdf<br>
+                &nbsp;&nbsp;└── <span class="val">800456789/</span><br>
+                &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└── RTF_800456789_B1_2024.pdf
+              </div>
+            </div>
+          </div>
+
+          <hr class="divider"/>
+
+          <div class="step">
+            <div class="step-num">3</div>
+            <div class="step-body">
+              <h4>Generar contraseñas en Excel</h4>
+              <p>Usa esta fórmula para que cada proveedor tenga una contraseña única y fácil de enviar:</p>
+              <div class="code-block">=CONCAT("CERT",DERECHA(<span class="key">A2</span>,4),<span class="val">AÑO(HOY())</span>)</div>
+              <p>Ejemplo: NIT <code style="font-family:var(--mono);font-size:12px">900123456</code> → contraseña <code style="font-family:var(--mono);font-size:12px">CERT34562024</code></p>
+            </div>
+          </div>
+
+          <hr class="divider"/>
+
+          <div class="step">
+            <div class="step-num">4</div>
+            <div class="step-body">
+              <h4>Publicar el portal</h4>
+              <p><strong>GitHub Pages (gratis):</strong> sube <code style="font-family:var(--mono);font-size:12px">index.html</code> + <code style="font-family:var(--mono);font-size:12px">providers.json</code> al repositorio → Settings → Pages → rama main.</p>
+              <p style="margin-top:6px"><strong>SharePoint (ya incluido en M365):</strong> Documentos → Cargar página → pegar como página de SharePoint.</p>
+            </div>
+          </div>
+
+          <hr class="divider"/>
+
+          <div class="step">
+            <div class="step-num">5</div>
+            <div class="step-body">
+              <h4>Notificar a los proveedores</h4>
+              <p>Usa combinación de correspondencia de Outlook + Word con tu Excel de proveedores para enviar un correo masivo con URL del portal, NIT y contraseña asignada a cada uno.</p>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /s-admin -->
+
+</div><!-- /wrap -->
+</div><!-- /page -->
+
+
+<!-- ========================================================
+     LÓGICA DE LA APLICACIÓN
+     ======================================================== -->
+<script>
+// ── Inicialización ──────────────────────────────────────────
+document.getElementById('hdr-year').textContent       = CERT_YEAR;
+document.getElementById('hdr-year-badge').textContent = CERT_YEAR;
+document.getElementById('contact-info').textContent   = `${CONTACT_EMAIL} · ${CONTACT_TEL}`;
+document.getElementById('portal-contact').textContent = `${CONTACT_EMAIL} · ${CONTACT_TEL}`;
+document.getElementById('current-url').textContent    = window.location.origin + window.location.pathname;
+
+// ── Estado de la app ────────────────────────────────────────
+let providers    = {};   // { nit: { name, pass, email } }
+let currentNit   = null;
+let msalInstance = null;
+let msToken      = null;
+let isAdminMode  = false;
+
+// ── Pantallas ───────────────────────────────────────────────
+function show(id) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  if (id === 's-admin') {
+    document.getElementById('main-wrap').classList.add('wide');
+  } else {
+    document.getElementById('main-wrap').classList.remove('wide');
+  }
+}
+
+// ── Cargar providers.json ────────────────────────────────────
+async function loadProviders() {
+  try {
+    const saved = localStorage.getItem('portal_providers');
+    if (saved) { providers = JSON.parse(saved); renderAdminTable(); return; }
+  } catch {}
+  try {
+    const r = await fetch('providers.json');
+    if (!r.ok) throw new Error('no file');
+    providers = await r.json();
+    localStorage.setItem('portal_providers', JSON.stringify(providers));
+    renderAdminTable();
+  } catch {
+    providers = {};
+    renderAdminTable();
+  }
+}
+
+// ── LOGIN PROVEEDOR ─────────────────────────────────────────
+document.getElementById('btn-login').addEventListener('click', doLogin);
+['inp-nit','inp-pass'].forEach(id => {
+  document.getElementById(id).addEventListener('keydown', e => { if(e.key==='Enter') doLogin(); });
+});
+
+function doLogin() {
+  const nit  = document.getElementById('inp-nit').value.trim().replace(/[\s\-\.]/g,'');
+  const pass = document.getElementById('inp-pass').value.trim();
+  const btn  = document.getElementById('btn-login');
+  const err  = document.getElementById('login-error');
+
+  err.classList.remove('show');
+  if (!nit || !pass) {
+    document.getElementById('login-error-txt').textContent = 'Complete todos los campos.';
+    err.classList.add('show'); return;
+  }
+
+  btn.classList.add('loading');
+  setTimeout(() => {
+    btn.classList.remove('loading');
+    const p = providers[nit];
+    if (!p || p.pass !== pass) {
+      document.getElementById('login-error-txt').textContent = 'NIT o contraseña incorrectos.';
+      err.classList.add('show'); return;
+    }
+    currentNit = nit;
+    renderPortal(nit, p);
+  }, 600);
+}
+
+// ── PORTAL PROVEEDOR ─────────────────────────────────────────
+async function renderPortal(nit, p) {
+  document.getElementById('p-name').textContent = p.name;
+  document.getElementById('p-nit').textContent  = 'NIT ' + nit;
+  document.getElementById('cert-list').innerHTML = '';
+  document.getElementById('certs-label').style.display  = 'none';
+  document.getElementById('info-contact').style.display = 'none';
+  document.getElementById('graph-error-alert').classList.remove('show');
+  document.getElementById('graph-loading-alert').classList.add('show');
+  show('s-portal');
+
+  // Si hay token de Microsoft Graph, leer desde OneDrive
+  if (msToken) {
+    await loadCertsFromOneDrive(nit);
+  } else {
+    // Modo demo: mostrar archivos de ejemplo
+    loadCertsDemo(nit);
+  }
+}
+
+// ── CERTIFICADOS DEMO (sin OneDrive conectado) ──────────────
+function loadCertsDemo(nit) {
+  document.getElementById('graph-loading-alert').classList.remove('show');
+  const demos = {
+    "900123456": [
+      { name:"Ret. fuente · Bim. 1 (Ene–Feb 2024)", type:"fuente", period:"Ene–Feb 2024" },
+      { name:"Ret. fuente · Bim. 2 (Mar–Abr 2024)", type:"fuente", period:"Mar–Abr 2024" },
+      { name:"Ret. IVA · Bim. 1 (Ene–Feb 2024)",   type:"iva",    period:"Ene–Feb 2024" },
+      { name:"Ret. ICA · Año 2024",                 type:"ica",    period:"Anual 2024"   },
+    ],
+    "800456789": [
+      { name:"Ret. fuente · Bim. 1 (Ene–Feb 2024)", type:"fuente", period:"Ene–Feb 2024" },
+      { name:"Ret. fuente · Bim. 2 (Mar–Abr 2024)", type:"fuente", period:"Mar–Abr 2024" },
+      { name:"Ret. fuente · Bim. 3 (May–Jun 2024)", type:"fuente", period:"May–Jun 2024" },
+      { name:"Ret. IVA · Bim. 1 (Ene–Feb 2024)",   type:"iva",    period:"Ene–Feb 2024" },
+      { name:"Ret. ICA · Año 2024",                 type:"ica",    period:"Anual 2024"   },
+    ],
+    "700111222": [
+      { name:"Ret. fuente · Bim. 1 (Ene–Feb 2024)", type:"fuente", period:"Ene–Feb 2024" },
+      { name:"Ret. ICA · Año 2024",                 type:"ica",    period:"Anual 2024"   },
+    ]
+  };
+  const certs = demos[nit] || [];
+  renderCertList(certs.map(c => ({ ...c, downloadFn: () => alert(`Modo demo.\n\nEn producción con OneDrive conectado, este botón descarga:\n${c.name}`) })));
+}
+
+// ── CERTIFICADOS DESDE ONEDRIVE ──────────────────────────────
+async function loadCertsFromOneDrive(nit) {
+  const loadingAlert = document.getElementById('graph-loading-alert');
+  const errorAlert   = document.getElementById('graph-error-alert');
+
+  try {
+    // Buscar todos los archivos en la carpeta raíz que contengan el NIT en el nombre
+    const url = `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeURIComponent(ONEDRIVE_FOLDER_PATH)}:/children`;
+    const res  = await fetch(url, { headers: { Authorization: `Bearer ${msToken}` } });
+
+    if (res.status === 404) {
+      loadingAlert.classList.remove('show');
+      renderCertList([]);
+      return;
+    }
+    if (!res.ok) throw new Error(`Graph error ${res.status}`);
+
+    const data  = await res.json();
+    // Filtrar archivos PDF cuyo nombre contenga el NIT
+    const files = (data.value || []).filter(f =>
+      f.name.toLowerCase().endsWith('.pdf') && f.name.startsWith(nit)
+    );
+
+    loadingAlert.classList.remove('show');
+
+    if (!files.length) {
+      renderCertList([]);
+      return;
+    }
+
+    const certs = files.map(f => {
+      const type = detectType(f.name);
+      return {
+        name:       formatCertName(f.name),
+        type:       type,
+        period:     detectPeriod(f.name),
+        size:       formatSize(f.size),
+        downloadFn: () => downloadFromOneDrive(f['@microsoft.graph.downloadUrl'], f.name)
+      };
+    });
+
+    certs.sort((a,b) => a.name.localeCompare(b.name, 'es'));
+    renderCertList(certs);
+
+  } catch (e) {
+    loadingAlert.classList.remove('show');
+    document.getElementById('graph-error-txt').textContent =
+      'No se pudieron cargar los certificados desde OneDrive. Verifique la conexión o comuníquese con soporte.';
+    errorAlert.classList.add('show');
+    console.error('Graph error:', e);
+  }
+}
+
+function detectType(name) {
+  const n = name.toUpperCase();
+  if (n.includes('ICA')) return 'ica';
+  if (n.includes('IVA')) return 'iva';
+  return 'fuente';
+}
+
+function detectPeriod(name) {
+  const m = name.match(/_B(\d)_?(\d{4})/i);
+  if (m) {
+    const bim = parseInt(m[1]);
+    const yr  = m[2];
+    const ranges = ['Ene–Feb','Mar–Abr','May–Jun','Jul–Ago','Sep–Oct','Nov–Dic'];
+    return `${ranges[bim-1] || 'Bim.'+bim} ${yr}`;
+  }
+  const y = name.match(/(\d{4})/);
+  return y ? `Anual ${y[1]}` : '—';
+}
+
+function formatCertName(filename) {
+  return filename
+    .replace(/\.pdf$/i,'')
+    .replace(/_/g,' ')
+    .replace(/\b(\w)/g, l => l.toUpperCase());
+}
+
+function formatSize(bytes) {
+  if (!bytes) return '';
+  if (bytes > 1048576) return (bytes/1048576).toFixed(1)+' MB';
+  return Math.round(bytes/1024)+' KB';
+}
+
+async function downloadFromOneDrive(downloadUrl, filename) {
+  if (!downloadUrl) {
+    // Fallback: redirect a Graph download con token
+    const nit = currentNit;
+    const url = `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeURIComponent(ONEDRIVE_FOLDER_PATH)}/${nit}/${encodeURIComponent(filename)}:/content`;
+    const res  = await fetch(url, { headers: { Authorization: `Bearer ${msToken}` } });
+    const blob = await res.blob();
+    downloadBlob(blob, filename);
+    return;
+  }
+  const res  = await fetch(downloadUrl);
+  const blob = await res.blob();
+  downloadBlob(blob, filename);
+}
+
+function downloadBlob(blob, filename) {
+  const a  = document.createElement('a');
+  a.href   = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+// ── RENDER LISTA CERTIFICADOS ────────────────────────────────
+function renderCertList(certs) {
+  const list = document.getElementById('cert-list');
+  document.getElementById('certs-label').style.display  = certs.length ? 'block' : 'none';
+  document.getElementById('info-contact').style.display = 'block';
+
+  if (!certs.length) {
+    list.innerHTML = `
+      <div class="empty">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+          <polyline points="14,2 14,8 20,8"/>
+        </svg>
+        <div>No hay certificados disponibles por el momento.</div>
+        <div style="font-size:11.5px;margin-top:4px;color:var(--hint)">Comuníquese con contabilidad si cree que esto es un error.</div>
+      </div>`;
+    return;
+  }
+
+  const typeL = { fuente:'Fuente', iva:'IVA', ica:'ICA' };
+  const icoCol = { fuente:'#1A4A8C', iva:'#8C5C00', ica:'#5A3CB5' };
+  const icoBg  = { fuente:'var(--blue-l)', iva:'var(--amber-l)', ica:'var(--purple-l)' };
+
+  list.innerHTML = certs.map((c, i) => `
+    <div class="cert-row">
+      <div class="cert-ico" style="background:${icoBg[c.type]}">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="${icoCol[c.type]}" stroke-width="1.8" stroke-linecap="round">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+          <polyline points="14,2 14,8 20,8"/>
+        </svg>
+      </div>
+      <div class="cert-info">
+        <div class="cert-name">${c.name}</div>
+        <div class="cert-meta">
+          <span class="badge b-${c.type}">${typeL[c.type]}</span>
+          <span>${c.period}</span>
+          ${c.size ? `<span style="color:var(--hint)">${c.size}</span>` : ''}
+        </div>
+      </div>
+      <button class="btn-dl" id="dl-btn-${i}" onclick="handleDownload(${i})">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="7,10 12,15 17,10"/>
+          <line x1="12" y1="15" x2="12" y2="3"/>
+        </svg>
+        PDF
+      </button>
+    </div>
+  `).join('');
+
+  // Guardar funciones de descarga
+  window._certDownloads = certs.map(c => c.downloadFn);
+}
+
+window.handleDownload = async function(i) {
+  const btn = document.getElementById('dl-btn-'+i);
+  btn.classList.add('downloading');
+  btn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="animation:spin .7s linear infinite"><path d="M21 12a9 9 0 1 1-18 0"/></svg> Descargando`;
+  try {
+    await window._certDownloads[i]();
+  } catch(e) {
+    console.error(e);
+  }
+  setTimeout(() => {
+    btn.classList.remove('downloading');
+    btn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7,10 12,15 17,10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> PDF`;
+  }, 2000);
+};
+
+// ── LOGOUT PROVEEDOR ─────────────────────────────────────────
+document.getElementById('btn-logout').addEventListener('click', () => {
+  currentNit = null;
+  document.getElementById('inp-nit').value  = '';
+  document.getElementById('inp-pass').value = '';
+  document.getElementById('login-error').classList.remove('show');
+  show('s-login');
+});
+
+// ── MICROSOFT MSAL / ONEDRIVE ────────────────────────────────
+function initMsal() {
+  if (CLIENT_ID === 'TU_CLIENT_ID_AQUI') return; // No configurado aún
+  try {
+    msalInstance = new msal.PublicClientApplication({
+      auth: {
+        clientId:    CLIENT_ID,
+        authority:   `https://login.microsoftonline.com/${TENANT_ID}`,
+        redirectUri: window.location.origin + window.location.pathname
+      },
+      cache: { cacheLocation: 'sessionStorage' }
+    });
+    msalInstance.handleRedirectPromise().then(handleMsResponse).catch(console.error);
+  } catch(e) { console.warn('MSAL init failed', e); }
+}
+
+async function handleMsResponse(resp) {
+  if (resp && resp.accessToken) {
+    msToken = resp.accessToken;
+    updateOdStatus(true, resp.account?.username);
+    // Si estaba en pantalla admin, volver al panel
+    if (isAdminMode || localStorage.getItem('admin_was_connected')) {
+      localStorage.removeItem('admin_was_connected');
+      show('s-admin');
+      document.getElementById('stat-total').textContent = Object.keys(providers).length;
+      countOneDriveCerts();
+    }
+    return;
+  }
+  // Intentar obtener token silencioso si ya hay sesión activa
+  if (msalInstance) {
+    try {
+      const accounts = msalInstance.getAllAccounts();
+      if (accounts.length > 0) {
+        const silentResp = await msalInstance.acquireTokenSilent({
+          scopes: ['Files.Read.All','User.Read'],
+          account: accounts[0]
+        });
+        msToken = silentResp.accessToken;
+        updateOdStatus(true, accounts[0].username);
+        if (localStorage.getItem('admin_was_connected')) {
+          localStorage.removeItem('admin_was_connected');
+          show('s-admin');
+          document.getElementById('stat-total').textContent = Object.keys(providers).length;
+          countOneDriveCerts();
+        }
+      }
+    } catch {}
+  }
+}
+
+document.getElementById('btn-connect-ms').addEventListener('click', async () => {
+  if (!msalInstance) {
+    document.getElementById('onedrive-status').textContent =
+      'Configure CLIENT_ID y TENANT_ID en el código antes de conectar.';
+    return;
+  }
+  try {
+    localStorage.setItem('admin_was_connected', '1');
+    await msalInstance.loginRedirect({
+      scopes: ['Files.Read.All','User.Read']
+    });
+  } catch(e) {
+    localStorage.removeItem('admin_was_connected');
+    document.getElementById('onedrive-status').textContent = 'Error al conectar: ' + e.message;
+  }
+});
+
+function updateOdStatus(ok, user) {
+  const el = document.getElementById('onedrive-status');
+  if (ok) {
+    el.textContent = `Conectado${user ? ' como ' + user : ''}. Los proveedores podrán descargar sus certificados directamente.`;
+    document.getElementById('hdr-user-label').textContent = user || '';
+    document.getElementById('hdr-user-label').style.display = user ? 'block' : 'none';
+  }
+}
+
+async function countOneDriveCerts() {
+  if (!msToken) return;
+  try {
+    const url = `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeURIComponent(ONEDRIVE_FOLDER_PATH)}:/children`;
+    const res  = await fetch(url, { headers: { Authorization: `Bearer ${msToken}` } });
+    const data = await res.json();
+    const folders = (data.value||[]).filter(f => f.folder);
+    let total = 0;
+    await Promise.all(folders.map(async folder => {
+      const r2 = await fetch(
+        `https://graph.microsoft.com/v1.0/me/drive/items/${folder.id}/children`,
+        { headers: { Authorization: `Bearer ${msToken}` } }
+      );
+      const d2 = await r2.json();
+      total += (d2.value||[]).filter(f => f.name.toLowerCase().endsWith('.pdf')).length;
+    }));
+    document.getElementById('stat-certs').textContent = total;
+  } catch { document.getElementById('stat-certs').textContent = 'Error'; }
+}
+
+// ── ADMIN LOGIN ──────────────────────────────────────────────
+document.getElementById('btn-go-admin').addEventListener('click', () => show('s-admin-login'));
+document.getElementById('btn-back-to-login').addEventListener('click', () => show('s-login'));
+
+document.getElementById('btn-admin-login').addEventListener('click', doAdminLogin);
+document.getElementById('inp-admin-pass').addEventListener('keydown', e => { if(e.key==='Enter') doAdminLogin(); });
+
+function doAdminLogin() {
+  const v   = document.getElementById('inp-admin-pass').value;
+  const err = document.getElementById('admin-login-error');
+  const btn = document.getElementById('btn-admin-login');
+  err.classList.remove('show');
+  btn.classList.add('loading');
+  setTimeout(() => {
+    btn.classList.remove('loading');
+    if (v !== ADMIN_PASS) { err.classList.add('show'); return; }
+    isAdminMode = true;
+    renderAdminTable();
+    show('s-admin');
+    document.getElementById('stat-total').textContent = Object.keys(providers).length;
+    document.getElementById('dash-ms-alert').style.display = msToken ? 'none' : 'flex';
+    if (msToken) countOneDriveCerts();
+  }, 500);
+}
+
+document.getElementById('btn-admin-logout').addEventListener('click', () => {
+  isAdminMode = false;
+  document.getElementById('inp-admin-pass').value = '';
+  show('s-login');
+});
+
+// ── TABS ADMIN ───────────────────────────────────────────────
+document.querySelectorAll('.tab').forEach(t => {
+  t.addEventListener('click', function() {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    this.classList.add('active');
+    ['t-dashboard','t-providers','t-setup'].forEach(id => {
+      document.getElementById(id).style.display = this.dataset.tab === id ? 'block' : 'none';
+    });
+  });
+});
+
+// ── TABLA ADMIN ──────────────────────────────────────────────
+function renderAdminTable() {
+  const tbody = document.getElementById('provider-tbody');
+  const entries = Object.entries(providers);
+  document.getElementById('tbl-count').textContent = entries.length;
+  document.getElementById('stat-total').textContent = entries.length;
+
+  tbody.innerHTML = entries.map(([nit, p]) => `
+    <tr>
+      <td style="font-family:var(--mono);font-size:12px">${nit}</td>
+      <td>${p.name}</td>
+      <td style="font-size:12px;color:var(--muted)">${p.email||'—'}</td>
+      <td class="pass-cell">${p.pass}</td>
+    </tr>
+  `).join('') || '<tr><td colspan="4" style="text-align:center;color:var(--hint);padding:20px">Sin proveedores cargados</td></tr>';
+}
+
+// ── UPLOAD CSV ───────────────────────────────────────────────
+const uploadZone = document.getElementById('upload-zone');
+uploadZone.addEventListener('click', () => document.getElementById('file-input').click());
+uploadZone.addEventListener('dragover', e => { e.preventDefault(); uploadZone.classList.add('drag'); });
+uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('drag'));
+uploadZone.addEventListener('drop', e => {
+  e.preventDefault(); uploadZone.classList.remove('drag');
+  handleCsvFile(e.dataTransfer.files[0]);
+});
+document.getElementById('file-input').addEventListener('change', e => handleCsvFile(e.target.files[0]));
+
+function handleCsvFile(file) {
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      const allLines = e.target.result.split(/\r?\n/).filter(l => l.trim());
+      if (!allLines.length) throw new Error('vacío');
+      // Detectar encabezado y posiciones de columnas
+      const header = allLines[0].split(',').map(c => c.trim().replace(/^\uFEFF/,'').replace(/^"|"$/g,'').toLowerCase());
+      const iNit  = header.findIndex(h => h.includes('nit'));
+      const iName = header.findIndex(h => h.includes('nombre') || h.includes('name'));
+      const iEmail= header.findIndex(h => h.includes('correo') || h.includes('email'));
+      const iPass = header.findIndex(h => h.includes('contra') || h.includes('pass') || h.includes('clave'));
+      if (iNit < 0 || iPass < 0) throw new Error('columnas');
+      const dataLines = allLines.slice(1);
+      const parsed = {};
+      dataLines.forEach(line => {
+        const cols = line.split(',').map(c => c.trim().replace(/^"|"$/g,''));
+        if (cols.length >= 2 && cols[iNit]) {
+          const nit = cols[iNit].replace(/[\s\-\.]/g,'');
+          if (!nit) return;
+          parsed[nit] = {
+            name:  iName  >= 0 ? cols[iName]  : nit,
+            email: iEmail >= 0 ? cols[iEmail] : '',
+            pass:  cols[iPass] || ''
+          };
+        }
+      });
+      if (!Object.keys(parsed).length) throw new Error('vacío');
+      providers = parsed;
+      localStorage.setItem('portal_providers', JSON.stringify(providers));
+      renderAdminTable();
+      const s = document.getElementById('upload-success');
+      document.getElementById('upload-success-txt').textContent =
+        `"${file.name}" cargado. ${Object.keys(parsed).length} proveedores registrados y guardados.`;
+      s.classList.add('show');
+      setTimeout(() => s.classList.remove('show'), 5000);
+    } catch(err) {
+      alert('Error al procesar el archivo. Verifique que sea un CSV con columnas: NIT, Nombre, Correo, Contraseña\nDetalle: ' + err.message);
+    }
+  };
+  reader.readAsText(file, 'UTF-8');
+}
+
+// ── EXPORTAR CSV ─────────────────────────────────────────────
+document.getElementById('btn-export-csv').addEventListener('click', () => {
+  const rows = ['NIT,Nombre,Email,Contraseña'];
+  Object.entries(providers).forEach(([nit,p]) => {
+    rows.push(`${nit},"${p.name}","${p.email||''}","${p.pass}"`);
+  });
+  const a = document.createElement('a');
+  a.href = 'data:text/csv;charset=utf-8,\uFEFF' + encodeURIComponent(rows.join('\n'));
+  a.download = `proveedores_${CERT_YEAR}.csv`;
+  a.click();
+});
+
+// ── PLANTILLA CSV ────────────────────────────────────────────
+document.getElementById('btn-download-template').addEventListener('click', () => {
+  const csv = [
+    'NIT,Nombre,Email,Contraseña',
+    '900123456,Suministros Técnicos S.A.S,cxp@suministrostec.com,CERT34562024',
+    '800456789,Logística Andina Ltda.,ctb@logisticaandina.co,CERT47892024',
+    '700111222,Constructora Bogotá S.A.,prov@constructora.com,CERT12222024',
+  ].join('\n');
+  const a = document.createElement('a');
+  a.href = 'data:text/csv;charset=utf-8,\uFEFF' + encodeURIComponent(csv);
+  a.download = 'plantilla_proveedores.csv';
+  a.click();
+});
+
+// ── ARRANQUE ─────────────────────────────────────────────────
+loadProviders();
+initMsal();
+</script>
+
+</body>
+</html>
